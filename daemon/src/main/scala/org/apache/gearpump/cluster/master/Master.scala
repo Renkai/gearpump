@@ -18,12 +18,11 @@
 
 package org.apache.gearpump.cluster.master
 
+import java.lang.management.ManagementFactory
 import java.util.concurrent.TimeUnit
 
 import akka.actor._
-import akka.pattern.ask
 import akka.remote.DisassociatedEvent
-import akka.util.Timeout
 import com.typesafe.config.Config
 import org.apache.gearpump.cluster.AppMasterToMaster._
 import org.apache.gearpump.cluster.ClientToMaster._
@@ -33,19 +32,20 @@ import org.apache.gearpump.cluster.MasterToWorker._
 import org.apache.gearpump.cluster.WorkerToMaster._
 import org.apache.gearpump.cluster.master.Master.{MasterInfo, WorkerTerminated, _}
 import org.apache.gearpump.cluster.scheduler.Scheduler.ApplicationFinished
-import org.apache.gearpump.jarstore.{JarFileContainerWrapper, JarFileContainer, JarStore}
+import org.apache.gearpump.metrics.Metrics.ReportMetrics
+import org.apache.gearpump.metrics.{MetricsReporterService, Metrics, JvmMetricsSet}
+import org.apache.gearpump.jarstore.local.LocalJarStore
 import org.apache.gearpump.transport.HostPort
 import org.apache.gearpump.util.Constants._
+import org.apache.gearpump.util.HistoryMetricsService.HistoryMetricsConfig
 import org.apache.gearpump.util._
 import org.slf4j.Logger
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 import scala.collection.immutable
-import scala.concurrent.{Await, Future}
 
 private[cluster] class Master extends Actor with Stash {
-  import context.dispatcher
   private val LOG: Logger = LogUtil.getLogger(getClass)
   private val systemConfig : Config = context.system.settings.config
   private implicit val timeout = Constants.FUTURE_TIMEOUT
@@ -61,32 +61,52 @@ private[cluster] class Master extends Actor with Stash {
 
   private val birth = System.currentTimeMillis()
 
+  private var nextWorkerId = 0
+
+  // register jvm metrics
+  Metrics(context.system).register(new JvmMetricsSet(s"master"))
+
   LOG.info("master is started at " + ActorUtil.getFullPath(context.system, self.path) + "...")
 
   val jarStoreRootPath = systemConfig.getString(Constants.GEARPUMP_APP_JAR_STORE_ROOT_PATH)
-  val jarStore = context.actorOf(JarStore.props(jarStoreRootPath))
+
+  val jarStore = if(Util.isLocalPath(jarStoreRootPath)) {
+    Some(context.actorOf(Props(classOf[LocalJarStore], jarStoreRootPath)))
+  } else{
+    None
+  }
 
   private val hostPort = HostPort(ActorUtil.getSystemAddress(context.system).hostPort)
+
+  val metricsEnabled = systemConfig.getBoolean(GEARPUMP_METRIC_ENABLED)
+  val historyMetricsService = if (metricsEnabled) {
+    val getHistoryMetricsConfig = HistoryMetricsConfig(systemConfig)
+    val historyMetricsService = {
+      context.actorOf(Props(new HistoryMetricsService("master", getHistoryMetricsConfig)))
+    }
+
+    val metricsReportService = context.actorOf(Props(new MetricsReporterService(Metrics(context.system))))
+    historyMetricsService.tell(ReportMetrics, metricsReportService)
+    Some(historyMetricsService)
+  } else {
+    None
+  }
 
   override def receive : Receive = workerMsgHandler orElse
     appMasterMsgHandler orElse
     clientMsgHandler orElse
+    metricsService orElse
     jarStoreService orElse
     terminationWatch orElse
     disassociated orElse
     ActorUtil.defaultMsgHandler(self)
 
-  final val undefinedUid = 0
-  @tailrec final def newUid(): Int = {
-    val uid = Util.randInt
-    if (uid == undefinedUid) newUid()
-    else uid
-  }
-
   def workerMsgHandler : Receive = {
     case RegisterNewWorker =>
-      val workerId = newUid()
+      val workerId = nextWorkerId
+      nextWorkerId += 1
       self forward RegisterWorker(workerId)
+
     case RegisterWorker(id) =>
       context.watch(sender())
       sender ! WorkerRegistered(id, MasterInfo(self, birth))
@@ -99,11 +119,13 @@ private[cluster] class Master extends Actor with Stash {
   }
 
   def jarStoreService : Receive = {
-    case GetJarFileContainer =>
-      val client = sender
-      (jarStore ? GetJarFileContainer).asInstanceOf[Future[JarFileContainer]].map{container =>
-        client ! new JarFileContainerWrapper(container)
-      }
+    case GetJarStoreServer =>
+      jarStore.foreach(_ forward GetJarStoreServer)
+  }
+
+  def metricsService : Receive = {
+    case query: QueryHistoryMetrics =>
+      historyMetricsService.foreach(_ forward query)
   }
 
   def appMasterMsgHandler : Receive = {
@@ -122,7 +144,19 @@ private[cluster] class Master extends Actor with Stash {
       val aliveFor = System.currentTimeMillis() - birth
       val logFileDir = LogUtil.daemonLogDir(systemConfig).getAbsolutePath
       val userDir = System.getProperty("user.dir");
-      val masterDescription = MasterDescription(hostPort.toTuple, getMasterClusterList.map(_.toTuple), aliveFor, logFileDir, jarStoreRootPath, MasterStatus.Synced, userDir)
+
+      val masterDescription =
+        MasterSummary(
+          hostPort.toTuple,
+          getMasterClusterList.map(_.toTuple),
+          aliveFor,
+          logFileDir,
+          jarStoreRootPath,
+          MasterStatus.Synced,
+          userDir,
+          List.empty[MasterActivity],
+          jvmName = ManagementFactory.getRuntimeMXBean().getName())
+
       sender ! MasterData(masterDescription)
 
     case invalidAppMaster: InvalidAppMaster =>

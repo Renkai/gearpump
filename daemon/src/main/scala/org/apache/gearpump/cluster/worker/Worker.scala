@@ -19,6 +19,7 @@
 package org.apache.gearpump.cluster.worker
 
 import java.io.File
+import java.lang.management.ManagementFactory
 import java.net.URL
 import java.util.concurrent.{ExecutorService, Executors, TimeUnit}
 
@@ -27,7 +28,7 @@ import akka.pattern.pipe
 import com.typesafe.config.{Config, ConfigFactory}
 import org.apache.gearpump.cluster.AppMasterToMaster.{WorkerData, GetWorkerData}
 import org.apache.gearpump.cluster.AppMasterToWorker._
-import org.apache.gearpump.cluster.ClientToMaster.QueryWorkerConfig
+import org.apache.gearpump.cluster.ClientToMaster.{QueryHistoryMetrics, QueryWorkerConfig}
 import org.apache.gearpump.cluster.{ExecutorContext, ExecutorJVMConfig, ClusterConfig}
 import org.apache.gearpump.cluster.MasterToClient.WorkerConfig
 import org.apache.gearpump.cluster.MasterToWorker._
@@ -36,6 +37,11 @@ import org.apache.gearpump.cluster.WorkerToMaster._
 import org.apache.gearpump.cluster.master.Master.MasterInfo
 import org.apache.gearpump.cluster.scheduler.Resource
 import org.apache.gearpump.cluster.worker.Worker._
+import org.apache.gearpump.metrics.Metrics.ReportMetrics
+import org.apache.gearpump.metrics.{MetricsReporterService, Metrics, JvmMetricsSet}
+import org.apache.gearpump.util.Constants._
+import org.apache.gearpump.util.HistoryMetricsService.HistoryMetricsConfig
+import org.apache.gearpump.jarstore.{ActorSystemRequired, ConfigRequired, JarStoreService}
 import org.apache.gearpump.util._
 import org.slf4j.Logger
 
@@ -55,15 +61,23 @@ private[cluster] class Worker(masterProxy : ActorRef) extends Actor with TimeOut
   private val address = ActorUtil.getFullPath(context.system, self.path)
   private var resource = Resource.empty
   private var allocatedResources = Map[ActorRef, Resource]()
-  private var executorsInfo = Map[ActorRef, ExecutorInfo]()
+  private var executorsInfo = Map[ActorRef, ExecutorSlots]()
   private var id = -1
   private val createdTime = System.currentTimeMillis()
   private var masterInfo: MasterInfo = null
   private var executorNameToActor = Map.empty[String, ActorRef]
+  private val jarStoreService = JarStoreService.get(systemConfig)
+  jarStoreService match {
+    case needConfig: ConfigRequired => needConfig.init(systemConfig)
+    case needSystem: ActorSystemRequired => needSystem.init(context.system)
+  }
 
   private val ioPool = ExecutionContext.fromExecutorService(Executors.newCachedThreadPool())
 
   private var totalSlots: Int = 0
+
+  val metricsEnabled = systemConfig.getBoolean(GEARPUMP_METRIC_ENABLED)
+  var historyMetricsService: Option[ActorRef] = None
 
   override def receive : Receive = null
   var LOG: Logger = LogUtil.getLogger(getClass)
@@ -71,12 +85,34 @@ private[cluster] class Worker(masterProxy : ActorRef) extends Actor with TimeOut
   def service: Receive =
     appMasterMsgHandler orElse
       clientMessageHandler orElse
+      metricsService orElse
       terminationWatch(masterInfo.master) orElse
       ActorUtil.defaultMsgHandler(self)
+
+  def metricsService : Receive = {
+    case query: QueryHistoryMetrics =>
+      historyMetricsService.foreach(_ forward query)
+  }
 
   def waitForMasterConfirm(killSelf : Cancellable) : Receive = {
     case WorkerRegistered(id, masterInfo) =>
       this.id = id
+      // register jvm metrics
+      Metrics(context.system).register(new JvmMetricsSet(s"worker${id}"))
+
+      historyMetricsService = if (metricsEnabled) {
+        val getHistoryMetricsConfig = HistoryMetricsConfig(systemConfig)
+        val historyMetricsService = {
+          context.actorOf(Props(new HistoryMetricsService("worker" + id, getHistoryMetricsConfig)))
+        }
+
+        val metricsReportService = context.actorOf(Props(new MetricsReporterService(Metrics(context.system))))
+        historyMetricsService.tell(ReportMetrics, metricsReportService)
+        Some(historyMetricsService)
+      } else {
+        None
+      }
+
       this.masterInfo = masterInfo
       killSelf.cancel()
       context.watch(masterInfo.master)
@@ -108,14 +144,15 @@ private[cluster] class Worker(masterProxy : ActorRef) extends Actor with TimeOut
       } else {
         val actorName = ActorUtil.actorNameForExecutor(launch.appId, launch.executorId)
 
-        val executor = context.actorOf(Props(classOf[ExecutorWatcher], launch, masterInfo, ioPool))
+        val executor = context.actorOf(Props(classOf[ExecutorWatcher], launch, masterInfo, ioPool, jarStoreService))
         executorNameToActor += actorName ->executor
 
         resource = resource - launch.resource
         allocatedResources = allocatedResources + (executor -> launch.resource)
 
         reportResourceToMaster
-        executorsInfo += executor -> ExecutorInfo(launch.appId, launch.executorId, launch.resource.slots)
+        executorsInfo += executor ->
+          ExecutorSlots(launch.appId, launch.executorId, launch.resource.slots)
         context.watch(executor)
       }
     case UpdateResourceFailed(reason, ex) =>
@@ -126,9 +163,17 @@ private[cluster] class Worker(masterProxy : ActorRef) extends Actor with TimeOut
     case GetWorkerData(workerId) =>
       val aliveFor = System.currentTimeMillis() - createdTime
       val logDir = LogUtil.daemonLogDir(systemConfig).getAbsolutePath
-      val userDir = System.getProperty("user.dir");
-      sender ! WorkerData(WorkerDescription(id, "active", address,
-        aliveFor, logDir, executorsInfo.values.toArray, totalSlots, resource.slots, userDir))
+      val userDir = System.getProperty("user.dir")
+      sender ! WorkerData(WorkerSummary(
+        id, "active",
+        address,
+        aliveFor,
+        logDir,
+        executorsInfo.values.toArray,
+        totalSlots,
+        resource.slots,
+        userDir,
+        jvmName = ManagementFactory.getRuntimeMXBean().getName()))
     case ChangeExecutorResource(appId, executorId, usedResource) =>
       for (executor <- executorActorRef(appId, executorId);
            allocatedResource <- allocatedResources.get(executor)) {
@@ -220,13 +265,11 @@ private[cluster] class Worker(masterProxy : ActorRef) extends Actor with TimeOut
   }
 }
 
-import scala.concurrent.ExecutionContextExecutor
-
 private[cluster] object Worker {
 
   case class ExecutorResult(result : Try[Int])
 
-  class ExecutorWatcher(launch: LaunchExecutor, masterInfo: MasterInfo, ioPool: ExecutionContext) extends Actor {
+  class ExecutorWatcher(launch: LaunchExecutor, masterInfo: MasterInfo, ioPool: ExecutionContext, jarStoreService: JarStoreService) extends Actor {
 
     val config = context.system.settings.config
     private val LOG: Logger = LogUtil.getLogger(getClass, app = launch.appId, executor = launch.executorId)
@@ -259,7 +302,7 @@ private[cluster] object Worker {
       val process = Future {
         val jarPath = ctx.jar.map { appJar =>
           val tempFile = File.createTempFile(appJar.name, ".jar")
-          appJar.container.copyToLocalFile(tempFile)
+          jarStoreService.copyToLocalFile(tempFile, appJar.filePath)
           val file = new URL("file:" + tempFile)
           file.getFile
         }

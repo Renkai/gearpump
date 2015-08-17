@@ -78,7 +78,11 @@ private[appmaster] class TaskManager(
     (clockService ? GetLatestMinClock).asInstanceOf[Future[LatestMinClock]].map(_.clock)
   }
 
-  private var startClock: Future[TimeStamp] = getMinClock
+  private def getStartClock: Future[TimeStamp] = {
+    (clockService ? GetStartClock).asInstanceOf[Future[StartClock]].map(_.clock)
+  }
+
+  private var startClock: Future[TimeStamp] = getStartClock
 
   private val startTasks: StateFunction = {
     case Event(executor: ExecutorStarted, state) =>
@@ -129,7 +133,8 @@ private[appmaster] class TaskManager(
       val status = register.registerTask(taskId, TaskLocation(executorId, host))
       if (status == Accept) {
         LOG.info(s"RegisterTask($taskId) TaskLocation: $host, Executor: $executorId")
-        startClock.map(client ! Start(_, ids.newSessionId))
+        val sessionId = ids.newSessionId
+        startClock.map(client ! Start(_, sessionId))
         checkApplicationReady(state)
       } else {
         sender ! TaskRejected
@@ -267,7 +272,6 @@ private[appmaster] class TaskManager(
       dagManager ! GetLatestDAG
       LOG.info(s"goto state ApplicationReady(dag = ${newDagVersion})...")
 
-
     case _ -> Recovery =>
       val recoverDagVersion = nextStateData.dag.version
       executorManager ! BroadCast(RestartTasks(recoverDagVersion))
@@ -275,7 +279,7 @@ private[appmaster] class TaskManager(
       self ! CheckApplicationReady
 
       // Use new Start Clock so that we recover at timepoint we fails.
-      startClock = getMinClock
+      startClock = getStartClock
       LOG.info(s"goto state Recovery(recoverDag = $recoverDagVersion)...")
 
     case _ -> DynamicDAG =>
@@ -350,17 +354,12 @@ private [appmaster] object TaskManager {
 
 
   class SessionIdFactory {
-    private val ids = new util.HashSet[Int]()
+    private var nextSessionId = 1
 
-    @tailrec
     final def newSessionId: Int = {
-      val id = Util.randInt
-      if (ids.contains(id)) {
-        newSessionId
-      } else {
-        ids.add(id)
-        id
-      }
+      val sessionId = nextSessionId
+      nextSessionId += 1
+      sessionId
     }
   }
 }

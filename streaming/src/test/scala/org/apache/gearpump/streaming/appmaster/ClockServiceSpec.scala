@@ -19,7 +19,7 @@ package org.apache.gearpump.streaming.appmaster
 
 import akka.actor.{ActorSystem, Props}
 import akka.testkit.{ImplicitSender, TestKit, TestProbe}
-import org.apache.gearpump.cluster.TestUtil
+import org.apache.gearpump.cluster.{UserConfig, TestUtil}
 import org.apache.gearpump.partitioner.{HashPartitioner, Partitioner, PartitionerDescription}
 import org.apache.gearpump.streaming.appmaster.ClockService.{ChangeToNewDAG, ChangeToNewDAGSuccess, HealthChecker, ProcessorClock}
 import org.apache.gearpump.streaming.appmaster.ClockServiceSpec.Store
@@ -38,8 +38,8 @@ class ClockServiceSpec(_system: ActorSystem) extends TestKit(_system) with Impli
   def this() = this(ActorSystem("ClockServiceSpec", TestUtil.DEFAULT_CONFIG))
 
   val hash = Partitioner[HashPartitioner]
-  val task1 = ProcessorDescription(id = 0, classOf[TaskActor].getName, 1)
-  val task2 = ProcessorDescription(id = 1, classOf[TaskActor].getName, 1)
+  val task1 = ProcessorDescription(id = 0, taskClass = classOf[TaskActor].getName, parallelism = 1)
+  val task2 = ProcessorDescription(id = 1, taskClass = classOf[TaskActor].getName, parallelism = 1)
   val dag = DAG(Graph(task1 ~ hash ~> task2))
 
   override def afterAll {
@@ -86,9 +86,9 @@ class ClockServiceSpec(_system: ActorSystem) extends TestKit(_system) with Impli
       clockService.tell(UpdateClock(TaskId(0, 0), 200), task.ref)
       task.expectMsgType[UpstreamMinClock]
 
-      val task3 = ProcessorDescription(id = 3, classOf[TaskActor].getName, 1)
-      val task4 = ProcessorDescription(id = 4, classOf[TaskActor].getName, 1)
-      val task5 = ProcessorDescription(id = 5, classOf[TaskActor].getName, 1)
+      val task3 = ProcessorDescription(id = 3, taskClass = classOf[TaskActor].getName, parallelism = 1)
+      val task4 = ProcessorDescription(id = 4, taskClass = classOf[TaskActor].getName, parallelism = 1)
+      val task5 = ProcessorDescription(id = 5, taskClass = classOf[TaskActor].getName, parallelism = 1)
       val dagAddMiddleNode = DAG(Graph(
         task1 ~ hash ~> task2,
         task1 ~ hash ~> task3,
@@ -113,6 +113,50 @@ class ClockServiceSpec(_system: ActorSystem) extends TestKit(_system) with Impli
       // For source task, set the initial clock as startClock
       assert(clocks(task5.id) == startClock)
     }
+
+    "maintain global checkpoint time" in {
+      val store = new Store()
+      val startClock  = 100L
+      store.put(ClockService.START_CLOCK, startClock)
+      val clockService = system.actorOf(Props(new ClockService(dag, store)))
+      clockService ! UpdateClock(TaskId(0, 0), 200L)
+      expectMsgType[UpstreamMinClock]
+      clockService ! UpdateClock(TaskId(1, 0), 200L)
+      expectMsgType[UpstreamMinClock]
+
+      clockService ! GetStartClock
+      expectMsg(StartClock(200L))
+
+      val conf = UserConfig.empty.withBoolean("state.checkpoint.enable", true)
+      val task3 = ProcessorDescription(id = 3, taskClass = classOf[TaskActor].getName, parallelism = 1, taskConf = conf)
+      val task4 = ProcessorDescription(id = 4, taskClass = classOf[TaskActor].getName, parallelism = 1, taskConf = conf)
+      val dagWithStateTasks = DAG(Graph(
+        task1 ~ hash ~> task2,
+        task1 ~ hash ~> task3,
+        task3 ~ hash ~> task2,
+        task2 ~ hash ~> task4
+      ))
+
+      val taskId3 = TaskId(3, 0)
+      val taskId4 = TaskId(4, 0)
+
+      clockService ! ChangeToNewDAG(dagWithStateTasks)
+      expectMsgType[ChangeToNewDAGSuccess]
+
+      clockService ! ReportCheckpointClock(taskId3, startClock)
+      clockService ! ReportCheckpointClock(taskId4, startClock)
+      clockService ! GetStartClock
+      expectMsg(StartClock(startClock))
+
+      clockService ! ReportCheckpointClock(taskId3, 200L)
+      clockService ! ReportCheckpointClock(taskId4, 300L)
+      clockService ! GetStartClock
+      expectMsg(StartClock(startClock))
+
+      clockService ! ReportCheckpointClock(taskId3, 300L)
+      clockService ! GetStartClock
+      expectMsg(StartClock(300L))
+    }
   }
 
   "ProcessorClock" should {
@@ -135,10 +179,10 @@ class ClockServiceSpec(_system: ActorSystem) extends TestKit(_system) with Impli
   "HealthChecker" should {
     "report stalling if the clock is not advancing" in {
       val healthChecker = new HealthChecker(stallingThresholdSeconds = 1)
-      val source = ProcessorDescription(id = 0, null, parallelism = 1)
+      val source = ProcessorDescription(id = 0, taskClass = null, parallelism = 1)
       val sourceClock = new ProcessorClock(0, 1)
       sourceClock.init(0L)
-      val sink = ProcessorDescription(id = 1, null, parallelism = 1)
+      val sink = ProcessorDescription(id = 1, taskClass = null, parallelism = 1)
       val sinkClock = new ProcessorClock(1, 1)
       sinkClock.init(0L)
       val graph = Graph.empty[ProcessorDescription, PartitionerDescription]

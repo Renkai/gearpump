@@ -18,17 +18,21 @@
 
 package org.apache.gearpump.streaming.executor
 
+import java.lang.management.ManagementFactory
+
 import akka.actor.SupervisorStrategy.{Resume, Stop}
 import akka.actor._
+import com.typesafe.config.Config
 import org.apache.gearpump.cluster.MasterToAppMaster.MessageLoss
 import org.apache.gearpump.cluster.{ExecutorContext, UserConfig}
 import org.apache.gearpump.metrics.Metrics.{ReportMetrics, DemandMoreMetrics}
-import org.apache.gearpump.metrics.{Metrics, MetricsReporterService}
+import org.apache.gearpump.metrics.{JvmMetricsSet, Metrics, MetricsReporterService}
 import org.apache.gearpump.serializer.KryoPool
 import org.apache.gearpump.streaming.AppMasterToExecutor._
 import org.apache.gearpump.streaming.ExecutorToAppMaster.RegisterExecutor
+import org.apache.gearpump.streaming._
 import org.apache.gearpump.streaming.appmaster.TaskRegistry.TaskLocations
-import org.apache.gearpump.streaming.executor.Executor.{RestartTasks, TaskArgumentStore, TaskLocationReady, TaskStopped}
+import org.apache.gearpump.streaming.executor.Executor._
 import org.apache.gearpump.streaming.executor.TaskLauncher.TaskArgument
 import org.apache.gearpump.streaming.task.{Subscriber, TaskId}
 import org.apache.gearpump.transport.{Express, HostPort}
@@ -51,6 +55,8 @@ class Executor(executorContext: ExecutorContext, userConf : UserConfig, launcher
 
   private val LOG: Logger = LogUtil.getLogger(getClass, executor = executorId, app = appId)
 
+  private val address = ActorUtil.getFullPath(context.system, self.path)
+
   private val kryoPool =  new KryoPool(context.system.asInstanceOf[ExtendedActorSystem])
 
   LOG.info(s"Executor ${executorId} has been started, start to register itself...")
@@ -67,6 +73,9 @@ class Executor(executorContext: ExecutorContext, userConf : UserConfig, launcher
   val metricsEnabled = systemConfig.getBoolean(GEARPUMP_METRIC_ENABLED)
 
   if (metricsEnabled) {
+    // register jvm metrics
+    Metrics(context.system).register(new JvmMetricsSet(s"app${appId}.executor${executorId}"))
+
     val metricsReportService = context.actorOf(Props(new MetricsReporterService(Metrics(context.system))))
     appMaster.tell(ReportMetrics, metricsReportService)
   }
@@ -152,6 +161,22 @@ class Executor(executorContext: ExecutorContext, userConf : UserConfig, launcher
         task._2 ! PoisonPill
       }
       context.become(restartingTask(dagVersion, remain = tasks.keys.size, restarted = Map.empty[TaskId, ActorRef]))
+
+    case get: GetExecutorSummary =>
+      val logFile = LogUtil.applicationLogDir(systemConfig)
+      val processorTasks = tasks.keySet.groupBy(_.processorId).mapValues(_.toList).view.force
+      sender ! ExecutorSummary(
+        executorId,
+        worker.workerId,
+        address,
+        logFile.getAbsolutePath,
+        "active",
+        tasks.size,
+        processorTasks,
+        jvmName = ManagementFactory.getRuntimeMXBean().getName())
+
+    case query: QueryExecutorConfig =>
+      sender ! ExecutorConfig(systemConfig)
   }
 
   def restartingTask(dagVersion: Int, remain: Int, restarted: Map[TaskId, ActorRef]): Receive = terminationWatch orElse {
@@ -219,4 +244,26 @@ object Executor {
   }
 
   case class TaskStopped(task: ActorRef)
+
+  case class ExecutorSummary(
+    id: Int,
+    workerId: Int,
+    actorPath: String,
+    logFile: String,
+    status: String,
+    taskCount: Int,
+    tasks: Map[ProcessorId, List[TaskId]],
+    jvmName: String
+  )
+
+  object ExecutorSummary {
+    def empty: ExecutorSummary = ExecutorSummary(0, 0, "", "", "", 1, null, jvmName = "")
+  }
+
+  case class GetExecutorSummary(executorId: Int)
+
+  case class QueryExecutorConfig(executorId: Int)
+
+  case class ExecutorConfig(config: Config)
+
 }

@@ -33,8 +33,8 @@ object Build extends sbt.Build {
   val slf4jVersion = "1.7.7"
   val gsCollectionsVersion = "6.2.0"
   
-  val scalaVersionMajor = "scala-2.11"
-  val scalaVersionNumber = "2.11.5"
+  val crossScalaVersionNumbers = Seq("2.10.5", "2.11.5")
+  val scalaVersionNumber = crossScalaVersionNumbers.last
   val sprayVersion = "1.3.2"
   val sprayJsonVersion = "1.3.1"
   val sprayWebSocketsVersion = "0.1.4"
@@ -50,6 +50,7 @@ object Build extends sbt.Build {
 
   override def projects: Seq[Project] = (super.projects.toList ++ BuildExample.projects.toList
       ++ Pack.projects.toList).toSeq
+
 
   val commonSettings = Seq(jacoco.settings:_*) ++ sonatypeSettings  ++ net.virtualvoid.sbt.graph.Plugin.graphSettings ++
     Seq(
@@ -68,7 +69,7 @@ object Build extends sbt.Build {
     ) ++
     Seq(
       scalaVersion := scalaVersionNumber,
-      crossScalaVersions := Seq("2.10.5"),
+      crossScalaVersions := crossScalaVersionNumbers,
       organization := "com.github.intel-hadoop",
       useGpg := false,
       pgpSecretRing := file("./secring.asc"),
@@ -161,7 +162,7 @@ object Build extends sbt.Build {
         "com.typesafe.akka" %% "akka-agent" % akkaVersion,
         "com.typesafe.akka" %% "akka-slf4j" % akkaVersion,
         "com.typesafe.akka" %% "akka-kernel" % akkaVersion,
-        "com.github.intel-hadoop" % "gearpump-shaded-akka-kryo" % kryoVersion,
+        "com.github.intel-hadoop" %% "gearpump-shaded-akka-kryo" % kryoVersion,
         "com.typesafe.akka" %% "akka-testkit" % akkaVersion % "test",
         "org.scalatest" %% "scalatest" % scalaTestVersion % "test",
         "org.scalacheck" %% "scalacheck" % scalaCheckVersion % "test",
@@ -242,11 +243,12 @@ object Build extends sbt.Build {
     "com.wandoulabs.akka" %% "spray-websocket" % sprayWebSocketsVersion
       exclude("com.typesafe.akka", "akka-actor_2.11"),
     "org.scalatest" %% "scalatest" % scalaTestVersion % "test",
-    "org.webjars" % "angularjs" % "1.4.3", // We stick on 1.3.x until angular-ui-select works
+    "org.webjars" % "angularjs" % "1.4.3", "org.webjars" % "angular-ui-router" % "0.2.15",
     "org.webjars" % "bootstrap" % "3.3.5",
     "com.lihaoyi" %% "upickle" % upickleVersion,
     "org.webjars" % "d3js" % "3.5.5",
     "org.webjars" % "momentjs" % "2.10.3",
+    "org.webjars" % "underscorejs" % "1.8.3",
     "org.webjars.bower" % "angular-loading-bar" % "0.8.0",
     "org.webjars.bower" % "angular-smart-table" % "2.1.1",
     "org.webjars.bower" % "angular-motion" % "0.4.2",
@@ -256,11 +258,13 @@ object Build extends sbt.Build {
     "org.webjars" % "select2" % "3.5.2",
     "org.webjars" % "select2-bootstrap-css" % "1.4.6",
     "org.webjars.bower" % "ng-file-upload" % "5.0.9",
-    "org.webjars.bower" % "vis" % "4.7.0"
+    "org.webjars.bower" % "vis" % "4.7.0",
+    "org.webjars" % "font-awesome" % "4.4.0"
   ).map(_.exclude("org.scalamacros", "quasiquotes_2.10")).map(_.exclude("org.scalamacros", "quasiquotes_2.10.3")))
 
   lazy val serviceJSSettings = Seq(
     scalaVersion := scalaVersionNumber,
+    crossScalaVersions := crossScalaVersionNumbers,
     checksums := Seq(""),
     requiresDOM := true,
     libraryDependencies ++= Seq(

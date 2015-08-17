@@ -23,9 +23,9 @@ import akka.testkit.TestActor.{AutoPilot, KeepRunning}
 import akka.testkit.{TestKit, TestProbe}
 import com.typesafe.config.ConfigFactory
 import org.apache.gearpump.cluster.AppMasterToMaster.{GetWorkerData, WorkerData}
-import org.apache.gearpump.cluster.ClientToMaster.{QueryWorkerConfig, ResolveWorkerId}
-import org.apache.gearpump.cluster.MasterToClient.{ResolveWorkerIdResult, WorkerConfig}
-import org.apache.gearpump.cluster.worker.WorkerDescription
+import org.apache.gearpump.cluster.ClientToMaster.{QueryHistoryMetrics, QueryWorkerConfig, ResolveWorkerId}
+import org.apache.gearpump.cluster.MasterToClient.{HistoryMetricsItem, HistoryMetrics, ResolveWorkerIdResult, WorkerConfig}
+import org.apache.gearpump.cluster.worker.WorkerSummary
 import org.scalatest.{BeforeAndAfterAll, FlatSpec, Matchers}
 import spray.testkit.ScalatestRouteTest
 
@@ -41,10 +41,13 @@ class WorkerServiceSpec extends FlatSpec with ScalatestRouteTest with WorkerServ
     new AutoPilot {
       def run(sender: ActorRef, msg: Any) = msg match {
         case GetWorkerData(appId) =>
-          sender ! WorkerData(WorkerDescription.empty)
+          sender ! WorkerData(WorkerSummary.empty)
           KeepRunning
         case QueryWorkerConfig(appId) =>
           sender ! WorkerConfig(null)
+          KeepRunning
+        case QueryHistoryMetrics(path, _) =>
+          sender ! HistoryMetrics(path, List.empty[HistoryMetricsItem])
           KeepRunning
       }
     }
@@ -75,6 +78,15 @@ class WorkerServiceSpec extends FlatSpec with ScalatestRouteTest with WorkerServ
   it should "return WorkerData" in {
     implicit val customTimeout = RouteTestTimeout(15.seconds)
     (Get(s"/api/$REST_VERSION/worker/1") ~> workerRoute).asInstanceOf[RouteResult] ~> check{
+      val responseBody = response.entity.asString
+      val config = Try(ConfigFactory.parseString(responseBody))
+      assert(config.isSuccess)
+    }
+  }
+
+  "MetricsQueryService" should "return history metrics" in {
+    implicit val customTimeout = RouteTestTimeout(15.seconds)
+    (Get(s"/api/$REST_VERSION/worker/0/metrics/worker") ~> workerRoute).asInstanceOf[RouteResult] ~> check {
       val responseBody = response.entity.asString
       val config = Try(ConfigFactory.parseString(responseBody))
       assert(config.isSuccess)

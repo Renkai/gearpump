@@ -22,9 +22,9 @@ import akka.actor.ActorRef
 import com.typesafe.config.Config
 import org.apache.gearpump.TimeStamp
 import org.apache.gearpump.cluster.MasterToAppMaster.AppMasterStatus
-import org.apache.gearpump.cluster.master.MasterDescription
+import org.apache.gearpump.cluster.master.MasterSummary
 import org.apache.gearpump.cluster.scheduler.{Resource, ResourceAllocation, ResourceRequest}
-import org.apache.gearpump.cluster.worker.WorkerDescription
+import org.apache.gearpump.cluster.worker.{WorkerSummary}
 import org.apache.gearpump.metrics.Metrics._
 
 import scala.util.{Success, Try}
@@ -41,7 +41,9 @@ object ClientToMaster {
 
   case class ResolveWorkerId(workerId: Int)
 
-  case object GetJarFileContainer
+  case object GetJarStoreServer
+
+  case class JarStoreServerAddress(url: String)
 
   case class QueryAppMasterConfig(appId: Int)
 
@@ -49,7 +51,7 @@ object ClientToMaster {
 
   case object QueryMasterConfig
 
-  case class QueryHistoryMetrics(appId: Int, path: String, readLatest: Boolean = false)
+  case class QueryHistoryMetrics(path: String, readLatest: Boolean = false)
 
   case class GetStallingTasks(appId: Int)
 
@@ -73,7 +75,7 @@ object MasterToClient {
 
   case class HistoryMetricsItem(time: TimeStamp, value: MetricType)
 
-  case class HistoryMetrics(appId: Int, path: String, metrics: List[HistoryMetricsItem])
+  case class HistoryMetrics(path: String, metrics: List[HistoryMetricsItem])
 
   case class LastFailure(time: TimeStamp, error: String)
 }
@@ -94,35 +96,34 @@ object AppMasterToMaster {
 
   //TODO:
   // clock field may not make sense for applications other than streaming
-  trait AppMasterDataDetail {
+  trait AppMasterSummary {
+
+    def appType: String
     def appId: Int
     def appName: String
     def actorPath: String
-
-    // from executor Id to executor path
-    def executors: Map[Int, String]
 
     def status: AppMasterStatus
     def startTime: TimeStamp
     def user: String
   }
 
-  case class GeneralAppMasterDataDetail(
+  case class GeneralAppMasterSummary(
       appId: Int,
+      appType: String = "general",
       appName: String = null,
       actorPath: String = null,
-      executors: Map[Int, String] = Map.empty[Int, String],
       status: AppMasterStatus = MasterToAppMaster.AppMasterActive,
       startTime: TimeStamp = 0L,
       user: String = null)
-    extends AppMasterDataDetail
+    extends AppMasterSummary
 
   case object GetAllWorkers
   case class GetWorkerData(workerId: Int)
-  case class WorkerData(workerDescription: WorkerDescription)
+  case class WorkerData(workerDescription: WorkerSummary)
 
   case object GetMasterData
-  case class MasterData(masterDescription: MasterDescription)
+  case class MasterData(masterDescription: MasterSummary)
 }
 
 object MasterToAppMaster {

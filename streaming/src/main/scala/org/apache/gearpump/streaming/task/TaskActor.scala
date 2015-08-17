@@ -25,13 +25,12 @@ import akka.actor._
 import io.gearpump.gs.collections.impl.map.mutable.primitive.IntShortHashMap
 import org.apache.gearpump.cluster.UserConfig
 import org.apache.gearpump.metrics.Metrics
-import org.apache.gearpump.metrics.Metrics.MetricType
-import org.apache.gearpump.serializer.{SerializerPool, KryoPool}
+import org.apache.gearpump.serializer.SerializerPool
 import org.apache.gearpump.streaming.AppMasterToExecutor._
 import org.apache.gearpump.streaming.ExecutorToAppMaster._
 import org.apache.gearpump.streaming.ProcessorId
 import org.apache.gearpump.streaming.executor.Executor.TaskLocationReady
-import org.apache.gearpump.util.{ActorUtil, LogUtil, TimeOutScheduler, Util}
+import org.apache.gearpump.util.{LogUtil, TimeOutScheduler}
 import org.apache.gearpump.{Message, TimeStamp}
 import org.slf4j.Logger
 
@@ -46,9 +45,9 @@ class TaskActor(
 
   def serializerPool: SerializerPool = inputSerializerPool
 
+  import org.apache.gearpump.streaming.Constants._
   import org.apache.gearpump.streaming.task.TaskActor._
   import taskContextData._
-  import org.apache.gearpump.streaming.Constants.{_}
   val config = context.system.settings.config
 
   val LOG: Logger = LogUtil.getLogger(getClass, app = appId, executor = executorId, task = taskId)
@@ -67,8 +66,9 @@ class TaskActor(
   private var life = taskContextData.life
 
   //latency probe
-  import scala.concurrent.duration._
   import context.dispatcher
+
+  import scala.concurrent.duration._
   final val LATENCY_PROBE_INTERVAL = FiniteDuration(1, TimeUnit.SECONDS)
 
   // clock report interval
@@ -84,12 +84,14 @@ class TaskActor(
   // securityChecker will be responsible of dropping messages from
   // unknown sources
   private val securityChecker  = new SecurityChecker(taskId, self)
-  private[task] var sessionId = 0
+  private[task] var sessionId = NONE_SESSION
 
   //report to appMaster with my address
   express.registerLocalActor(TaskId.toLong(taskId), self)
 
   final def receive : Receive = null
+
+  private var taskLocationReady = false
 
   task.setTaskActor(this)
 
@@ -129,7 +131,7 @@ class TaskActor(
   }
 
   def minClockAtCurrentTask: TimeStamp = {
-    this.subscriptions.foldLeft(task.stateClock.getOrElse(Long.MaxValue)){ (clock, subscription) =>
+    this.subscriptions.foldLeft(Long.MaxValue){ (clock, subscription) =>
       Math.min(clock, subscription._2.minClock)
     }
   }
@@ -188,15 +190,21 @@ class TaskActor(
 
       subscriptions.foreach(_._2.start)
 
-      context.become(handleMessages(doHandleMessage))
+      // clean up history message in the queue
+      doHandleMessage()
 
       // Put this as the last step so that the subscription is already initialized.
       // Message sending in current Task before onStart will not be delivered to
       // target
       onStart(new StartTime(clock))
 
-      // clean up history message in the queue
-      doHandleMessage()
+      if (taskLocationReady) {
+        self ! TaskLocationReady
+      }
+
+      context.become(handleMessages(doHandleMessage))
+    case TaskLocationReady =>
+      this.taskLocationReady = true
   }
 
   def stashMessages: Receive = handleMessages(() => Unit)
@@ -298,16 +306,22 @@ object TaskActor {
 
     def handleInitialAckRequest(ackRequest: InitialAckRequest): Ack = {
       LOG.debug(s"Handle InitialAckRequest for session $ackRequest" )
-      receivedMsgCount.put(ackRequest.sessionId, 0)
-      Ack(task_id, 0, 0, ackRequest.sessionId)
+      val sessionId = ackRequest.sessionId
+      if (sessionId == NONE_SESSION) {
+        LOG.error(s"SessionId is not initialized, ackRequest: $ackRequest")
+        null
+      } else {
+        receivedMsgCount.put(sessionId, 0)
+        Ack(task_id, 0, 0, sessionId)
+      }
     }
 
     def generateAckResponse(ackRequest: AckRequest, sender: ActorRef): Ack = {
-      val sessionId = getSessionId(sender)
+      val sessionId = ackRequest.sessionId
       if (receivedMsgCount.containsKey(sessionId)) {
         Ack(task_id, ackRequest.seq, receivedMsgCount.get(sessionId), ackRequest.sessionId)
       } else {
-        LOG.debug(s"task $task_id get unknown AckRequest $ackRequest from ${ackRequest}")
+        LOG.error(s"get unknown AckRequest $ackRequest from ${sender.toString()}")
         null
       }
     }
@@ -323,7 +337,7 @@ object TaskActor {
           Some(message)
         } else {
           // This is an illegal message,
-          LOG.debug(s"Task $task_id received message before receive the first AckRequest, session $sessionId")
+          LOG.debug(s"received message before receive the first AckRequest, session $sessionId")
           None
         }
       }
@@ -333,4 +347,6 @@ object TaskActor {
   case class SendAck(ack: Ack, targetTask: TaskId)
 
   case object FLUSH
+
+  val NONE_SESSION = -1
 }
